@@ -32,7 +32,9 @@ app = Flask(__name__)
 def health(): return "Bot is Alive", 200
 
 def run_flask():
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    # Render assigns the port dynamically; we read it from the environment[span_1](start_span)[span_1](end_span)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
 # --- UI HELPERS ---
 def get_progress_bar(current, total):
@@ -73,7 +75,6 @@ async def main_handler(client, message):
     if not media: return
     
     f_size = media.file_size
-    # Extract serial name and details from original filename
     original_full_name = media.file_name or "video.mp4"
     f_name_no_ext = os.path.splitext(original_full_name)[0]
     total_parts = math.ceil(f_size / CHUNK_SIZE)
@@ -81,9 +82,9 @@ async def main_handler(client, message):
     status = await message.reply("📡 **Analyzing Serial File...**")
     
     try:
-        # Determine mode based on Render's 512MB RAM/Disk limit[span_1](start_span)[span_1](end_span)
+        # Determine mode based on Render's 512MB RAM/Disk limit[span_2](start_span)[span_2](end_span)
         if f_size > RENDER_LIMIT:
-            await status.edit(f"⚠️ **Large File Detected ({humanize.naturalsize(f_size)})**\nUsing 'Binary Stream' to save Render memory. Small glitches may occur at join points.")
+            await status.edit(f"⚠️ **Large File Detected ({humanize.naturalsize(f_size)})**\nUsing 'Binary Stream' to save Render memory. Small glitches may occur.")
             mode = "CHUNK"
         else:
             await status.edit(f"✅ **Safe Size for Render.**\nUsing 'Smooth FFmpeg Mode' for perfect playback.")
@@ -113,7 +114,7 @@ async def main_handler(client, message):
             if os.path.exists(temp_path): os.remove(temp_path)
 
         else:
-            # Chunking mode to avoid 512MB crash[span_2](start_span)[span_2](end_span)
+            # Chunking mode to avoid 512MB crash by only keeping 19MB in memory at a time[span_3](start_span)[span_3](end_span)
             for i in range(total_parts):
                 part_no = i + 1
                 display_name = f"{f_name_no_ext} Part {part_no} of {total_parts}.mp4"
@@ -142,5 +143,6 @@ async def main_handler(client, message):
         await message.reply(f"❌ **Error:** `{str(e)}`")
 
 if __name__ == "__main__":
+    # Start the Flask health-check server on the background thread[span_4](start_span)[span_4](end_span)
     threading.Thread(target=run_flask, daemon=True).start()
     bot.run()
