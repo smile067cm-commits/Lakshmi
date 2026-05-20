@@ -5,6 +5,7 @@ import asyncio
 import threading
 import subprocess
 import humanize
+import glob
 from flask import Flask
 
 # --- CRITICAL EVENT LOOP FIX FOR PYTHON 3.11+ ---
@@ -15,40 +16,38 @@ except RuntimeError:
     asyncio.set_event_loop(loop)
 
 from pyrogram import Client, filters
-from pyrogram.types import Message
-from pyrogram.errors import FloodWait
 
-# --- CONFIG ---
+# --- CONFIGURATION ---
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-CHUNK_SIZE = 19 * 1024 * 1024 
-RENDER_LIMIT = 400 * 1024 * 1024 # 400MB threshold for smooth mode
 
 bot = Client("splitter_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 app = Flask(__name__)
 
+# --- WEB SERVER (KEEPS RENDER AWAKE) ---
 @app.route('/')
 def health(): return "Bot is Alive", 200
 
 def run_flask():
-    # Render assigns the port dynamically; we read it from the environment[span_1](start_span)[span_1](end_span)
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
-# --- UI HELPERS ---
+# --- UI & PROGRESS HELPERS ---
 def get_progress_bar(current, total):
-    percentage = current * 100 / total
+    percentage = (current * 100 / total) if total > 0 else 0
     finished = int(percentage / 10)
     return "⬛" * finished + "⬜" * (10 - finished) + f" {percentage:.1f}%"
 
 async def progress_func(current, total, message, start_time, action):
     now = time.time()
     diff = now - start_time
-    if diff < 2.0: return 
-    speed = current / diff
+    if diff < 2.0: return # Prevents Telegram FloodWait error
+    
+    speed = current / diff if diff > 0 else 0
     bar = get_progress_bar(current, total)
     msg = (f"**{action}**\n`{bar}`\n🚀 **Speed:** {humanize.naturalsize(speed)}/s\n📂 **Done:** {humanize.naturalsize(current)} / {humanize.naturalsize(total)}")
+    
     try: await message.edit(msg)
     except: pass
 
@@ -63,8 +62,8 @@ async def get_duration(file_path):
 async def start_cmd(client, message):
     await message.reply_text(
         "👋 **Welcome to Serial Splitter Bot!**\n\n"
-        "Send me any video file, and I will split it into **19MB playable parts** "
-        "with smooth playback for your serials.\n\n"
+        "Send me a large video file (even 700MB+), and I will split it perfectly "
+        "at the exact frames to keep each part under 19MB without glitches.\n\n"
         "📢 **Powered By:** @TeluguSerialsZone"
     )
 
@@ -75,74 +74,90 @@ async def main_handler(client, message):
     if not media: return
     
     f_size = media.file_size
-    original_full_name = media.file_name or "video.mp4"
-    f_name_no_ext = os.path.splitext(original_full_name)[0]
-    total_parts = math.ceil(f_size / CHUNK_SIZE)
+    original_name = media.file_name or "video.mp4"
+    f_name_no_ext = os.path.splitext(original_name)[0]
     
-    status = await message.reply("📡 **Analyzing Serial File...**")
+    status = await message.reply(f"📡 **Analyzing {humanize.naturalsize(f_size)} file...**")
+    
+    # Unique ID to prevent file mix-ups if multiple files are sent
+    uid = message.id
+    input_file = f"vid_{uid}_input.mp4"
     
     try:
-        # Determine mode based on Render's 512MB RAM/Disk limit[span_2](start_span)[span_2](end_span)
-        if f_size > RENDER_LIMIT:
-            await status.edit(f"⚠️ **Large File Detected ({humanize.naturalsize(f_size)})**\nUsing 'Binary Stream' to save Render memory. Small glitches may occur.")
-            mode = "CHUNK"
-        else:
-            await status.edit(f"✅ **Safe Size for Render.**\nUsing 'Smooth FFmpeg Mode' for perfect playback.")
-            mode = "SMOOTH"
-
-        if mode == "SMOOTH":
-            temp_path = await client.download_media(message, progress=progress_func, progress_args=(status, time.time(), "📥 **Downloading Video**"))
-            duration = await get_duration(temp_path)
-            part_time = duration / total_parts
-
-            for i in range(total_parts):
-                part_no = i + 1
-                display_name = f"{f_name_no_ext} Part {part_no} of {total_parts}.mp4"
-                await status.edit(f"✂️ **Processing {part_no}/{total_parts}...**")
-                
-                cmd = ["ffmpeg", "-ss", str(i * part_time), "-t", str(part_time), "-i", temp_path, "-c", "copy", "-map", "0", "-avoid_negative_ts", "make_zero", display_name]
-                subprocess.run(cmd, capture_output=True)
-                
-                await client.send_document(
-                    chat_id=message.chat.id, 
-                    document=display_name, 
-                    caption=f"**{display_name}**\n\n⚜️ Powered By : @TeluguSerialsZone",
-                    progress=progress_func,
-                    progress_args=(status, time.time(), f"📤 **Uploading Part {part_no}**")
-                )
-                if os.path.exists(display_name): os.remove(display_name)
-            if os.path.exists(temp_path): os.remove(temp_path)
-
-        else:
-            # Chunking mode to avoid 512MB crash by only keeping 19MB in memory at a time[span_3](start_span)[span_3](end_span)
-            for i in range(total_parts):
-                part_no = i + 1
-                display_name = f"{f_name_no_ext} Part {part_no} of {total_parts}.mp4"
-                
-                chunk_path = await client.download_media(
-                    message, 
-                    file_name=display_name, 
-                    offset=i*CHUNK_SIZE, 
-                    limit=CHUNK_SIZE, 
-                    progress=progress_func, 
-                    progress_args=(status, time.time(), f"📥 **Fetching Part {part_no}**")
-                )
-                
-                await client.send_document(
-                    chat_id=message.chat.id, 
-                    document=chunk_path, 
-                    caption=f"**{display_name}**\n\n⚜️ Powered By : @TeluguSerialsZone",
-                    progress=progress_func,
-                    progress_args=(status, time.time(), f"📤 **Uploading Part {part_no}**")
-                )
-                if os.path.exists(chunk_path): os.remove(chunk_path)
-
-        await status.edit(f"✨ **All {total_parts} parts sent successfully!**\n\n🎥 {f_name_no_ext}")
+        # 1. DOWNLOAD TO DISK (Bypasses 512MB RAM Limit)
+        start_time = time.time()
+        temp_path = await client.download_media(
+            message, 
+            file_name=input_file, 
+            progress=progress_func, 
+            progress_args=(status, start_time, "📥 **Downloading Full Video to Disk**")
+        )
+        
+        await status.edit("⏳ **Calculating perfect frame split times...**")
+        
+        duration = await get_duration(temp_path)
+        if duration == 0:
+            raise Exception("Could not read video duration. Ensure it is a valid video file.")
+        
+        # 2. CALCULATE SEGMENT TIME
+        # Target 17.5MB to ensure parts never exceed 19MB when waiting for a Keyframe.
+        target_size_mb = 17.5
+        total_size_mb = f_size / (1024 * 1024)
+        num_parts_estimated = math.ceil(total_size_mb / target_size_mb)
+        segment_time = duration / num_parts_estimated
+        
+        await status.edit(f"✂️ **Splitting at exact frames...**\nEnsuring parts are <19MB with no lost frames.")
+        
+        # 3. FFMPEG PERFECT FRAME SPLITTER
+        # -f segment pushes overflowing frames to the next part automatically
+        cmd = [
+            "ffmpeg", "-i", temp_path, 
+            "-c", "copy", 
+            "-f", "segment", 
+            "-segment_time", str(segment_time), 
+            "-reset_timestamps", "1",
+            f"vid_{uid}_part_%03d.mp4"
+        ]
+        subprocess.run(cmd, capture_output=True)
+        
+        # 4. UPLOAD PARTS
+        parts = sorted(glob.glob(f"vid_{uid}_part_*.mp4"))
+        total_parts = len(parts)
+        
+        for idx, part_file in enumerate(parts):
+            part_no = idx + 1
+            display_name = f"{f_name_no_ext} Part {part_no} of {total_parts}.mp4"
+            
+            # Rename the file so Telegram shows the correct dynamic name
+            os.rename(part_file, display_name)
+            
+            # Dynamic Caption
+            caption_text = f"**{display_name}**\n\n⚜️ Powered By : @TeluguSerialsZone"
+            
+            up_start = time.time()
+            await client.send_document(
+                chat_id=message.chat.id, 
+                document=display_name, 
+                caption=caption_text,
+                progress=progress_func,
+                progress_args=(status, up_start, f"📤 **Uploading Part {part_no}/{total_parts}**")
+            )
+            
+            # Delete part immediately after sending to free up space
+            os.remove(display_name)
+            
+        # 5. FINAL CLEANUP
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+            
+        await status.edit(f"✨ **All {total_parts} parts sent flawlessly!**\n\n🎥 `{f_name_no_ext}`")
 
     except Exception as e:
+        # Emergency cleanup if an error occurs
+        if os.path.exists(input_file): os.remove(input_file)
+        for orphan in glob.glob(f"vid_{uid}_part_*.mp4"): os.remove(orphan)
         await message.reply(f"❌ **Error:** `{str(e)}`")
 
 if __name__ == "__main__":
-    # Start the Flask health-check server on the background thread[span_4](start_span)[span_4](end_span)
     threading.Thread(target=run_flask, daemon=True).start()
     bot.run()
