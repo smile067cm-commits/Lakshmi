@@ -26,10 +26,11 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 bot = Client("splitter_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 app = Flask(__name__)
 
-# --- GLOBAL TASK MANAGER ---
+# --- GLOBAL TASK MANAGERS ---
 active_tasks = {}
+last_ui_update = {} # Tracks UI updates to prevent FloodWaits
 
-# --- WEB SERVER (KEEPS BOT AWAKE) ---
+# --- WEB SERVER ---
 @app.route('/')
 def health(): return "Bot is Alive", 200
 
@@ -43,25 +44,32 @@ def get_progress_bar(current, total):
     finished = int(percentage / 10)
     return "⬛" * finished + "⬜" * (10 - finished) + f" {percentage:.1f}%"
 
+async def _safe_edit(message, text):
+    """Edits the message with a strict 5-second timeout so it never freezes the bot."""
+    try:
+        await asyncio.wait_for(message.edit(text), timeout=5.0)
+    except MessageNotModified:
+        pass
+    except Exception:
+        pass
+
 async def progress_func(current, total, message, start_time, action, user_id):
     if not active_tasks.get(user_id, False):
         raise Exception("CANCELLED_BY_USER")
 
     now = time.time()
-    diff = now - start_time
-    # Wait 3 full seconds between edits to guarantee no FloodWait bans from UI updates
-    if diff < 3.0: return 
+    # STRICT 3-SECOND LIMIT: Prevents Telegram from throttling the bot UI
+    if now - last_ui_update.get(user_id, 0) < 3.0: 
+        return 
+    last_ui_update[user_id] = now
     
+    diff = now - start_time
     speed = current / diff if diff > 0 else 0
     bar = get_progress_bar(current, total)
     msg = (f"**{action}**\n`{bar}`\n🚀 **Speed:** {humanize.naturalsize(speed)}/s\n📂 **Done:** {humanize.naturalsize(current)} / {humanize.naturalsize(total)}")
     
-    try: 
-        await message.edit(msg)
-    except MessageNotModified:
-        pass # Ignore if the text hasn't changed enough
-    except Exception:
-        pass
+    # FIRE AND FORGET: Does not wait for Telegram to reply, preventing UI deadlocks
+    asyncio.create_task(_safe_edit(message, msg))
 
 async def get_duration(file_path):
     cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
@@ -73,6 +81,13 @@ def cleanup_files(uid):
     for f in glob.glob(f"vid_{uid}_*"):
         try: os.remove(f)
         except: pass
+
+async def send_log(client, chat_id, text):
+    """Sends background errors directly to the user's chat."""
+    try:
+        await client.send_message(chat_id, f"⚠️ **BACKEND LOG:**\n`{text}`")
+    except:
+        pass
 
 # --- COMMANDS ---
 @bot.on_message(filters.command("start"))
@@ -97,6 +112,7 @@ async def stop_cmd(client, message):
 @bot.on_message(filters.video | filters.document)
 async def main_handler(client, message):
     user_id = message.from_user.id
+    chat_id = message.chat.id
     
     if active_tasks.get(user_id):
         return await message.reply("⚠️ You already have a video processing! Please wait or use /stop.")
@@ -105,6 +121,7 @@ async def main_handler(client, message):
     if not media: return
     
     active_tasks[user_id] = True
+    last_ui_update[user_id] = 0
     uid = message.id
     input_file = f"vid_{uid}_input.mp4"
     
@@ -117,7 +134,7 @@ async def main_handler(client, message):
     try:
         start_time = time.time()
         
-        # 1. DOWNLOAD WITH TIMEOUT
+        # 1. DOWNLOAD
         try:
             temp_path = await asyncio.wait_for(
                 client.download_media(
@@ -129,7 +146,11 @@ async def main_handler(client, message):
                 timeout=7200 # 2 hours max
             )
         except asyncio.TimeoutError:
+            await send_log(client, chat_id, "Download Timed Out. Telegram server dropped the connection.")
             raise Exception("Telegram dropped the download connection. Please try again.")
+        except Exception as e:
+            if "CANCELLED" not in str(e): await send_log(client, chat_id, f"Download Error: {str(e)}")
+            raise e
         
         await status.edit("⏳ **Calculating perfect frame split times...**")
         
@@ -153,7 +174,7 @@ async def main_handler(client, message):
         
         if not active_tasks.get(user_id): raise Exception("CANCELLED_BY_USER")
 
-        # 4. UPLOAD PARTS (WITH BULLETPROOF RETRY SYSTEM)
+        # 4. UPLOAD PARTS
         parts = sorted(glob.glob(f"vid_{uid}_part_*.mp4"))
         total_parts = len(parts)
         
@@ -166,13 +187,12 @@ async def main_handler(client, message):
             os.rename(part_file, upload_path)
             caption_text = f"**{display_name}**\n\n⚜️ Powered By : @TeluguSerialsZone"
             
-            # --- THE IRON-CLAD UPLOAD LOOP ---
-            max_retries = 10  # Increased to 10 attempts
+            max_retries = 10
             for attempt in range(max_retries):
                 try:
                     up_start = time.time()
-                    
-                    # 4-MINUTE KILL SWITCH per part
+                    # 90 SECOND UPLOAD TIMEOUT
+                    # If a 19MB file takes more than 1.5 minutes to upload, the connection is dead. Kill it.
                     await asyncio.wait_for(
                         client.send_document(
                             chat_id=message.chat.id, 
@@ -182,39 +202,41 @@ async def main_handler(client, message):
                             progress=progress_func,
                             progress_args=(status, up_start, f"📤 **Uploading Part {part_no}/{total_parts}**", user_id)
                         ),
-                        timeout=240 
+                        timeout=90 
                     )
-                    break # Success! Exit the retry loop.
+                    break # Success!
                     
                 except asyncio.TimeoutError:
-                    await status.edit(f"⚠️ **Network Hang Detected on Part {part_no}.**\nForce-restarting upload... (Attempt {attempt+1}/{max_retries})")
-                    await asyncio.sleep(3)
+                    error_msg = f"Timeout on Part {part_no}. Attempt {attempt+1}/{max_retries}. Restarting chunk..."
+                    await send_log(client, chat_id, error_msg)
+                    await asyncio.sleep(2)
                     
                 except FloodWait as e:
-                    await status.edit(f"⚠️ **Telegram is throttling.**\nWaiting {e.value} seconds before resuming...")
-                    await asyncio.sleep(e.value + 5) # Generous wait to clear the ban
+                    error_msg = f"FloodWait triggered! Telegram demands we wait {e.value}s."
+                    await send_log(client, chat_id, error_msg)
+                    await asyncio.sleep(e.value + 5)
                     
                 except Exception as e:
-                    if "CANCELLED_BY_USER" in str(e): 
-                        raise e
+                    if "CANCELLED_BY_USER" in str(e): raise e
+                    await send_log(client, chat_id, f"Upload Exception on Part {part_no}: {str(e)}")
                     if attempt == max_retries - 1:
                         raise Exception(f"Failed to upload Part {part_no} after {max_retries} attempts.")
                     await asyncio.sleep(5)
-            # ----------------------------------------
             
-            # Delete part immediately to save disk space
             if os.path.exists(upload_path):
                 os.remove(upload_path)
             
         await status.edit(f"✨ **All {total_parts} parts sent flawlessly!**\n\n🎥 `{f_name_no_ext}`")
 
     except Exception as e:
-        if str(e) == "CANCELLED_BY_USER":
+        if "CANCELLED_BY_USER" in str(e):
             await status.edit("🛑 **Task successfully cancelled.** Disk cleared.")
         else:
             await status.edit(f"❌ **Error:** `{str(e)}`")
+            await send_log(client, chat_id, f"Final Fatal Error: {str(e)}")
     finally:
         active_tasks.pop(user_id, None)
+        last_ui_update.pop(user_id, None)
         cleanup_files(uid)
 
 if __name__ == "__main__":
