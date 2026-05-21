@@ -8,7 +8,7 @@ import humanize
 import glob
 from flask import Flask
 
-# --- CRITICAL EVENT LOOP FIX FOR PYTHON 3.11+ ---
+# --- CRITICAL EVENT LOOP FIX ---
 try:
     asyncio.get_event_loop()
 except RuntimeError:
@@ -16,7 +16,7 @@ except RuntimeError:
     asyncio.set_event_loop(loop)
 
 from pyrogram import Client, filters
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, MessageNotModified
 
 # --- CONFIGURATION ---
 API_ID = int(os.environ.get("API_ID", 0))
@@ -29,7 +29,7 @@ app = Flask(__name__)
 # --- GLOBAL TASK MANAGER ---
 active_tasks = {}
 
-# --- WEB SERVER ---
+# --- WEB SERVER (KEEPS BOT AWAKE) ---
 @app.route('/')
 def health(): return "Bot is Alive", 200
 
@@ -49,14 +49,19 @@ async def progress_func(current, total, message, start_time, action, user_id):
 
     now = time.time()
     diff = now - start_time
-    if diff < 2.5: return # Increased to 2.5s to further prevent FloodWaits
+    # Wait 3 full seconds between edits to guarantee no FloodWait bans from UI updates
+    if diff < 3.0: return 
     
     speed = current / diff if diff > 0 else 0
     bar = get_progress_bar(current, total)
     msg = (f"**{action}**\n`{bar}`\n🚀 **Speed:** {humanize.naturalsize(speed)}/s\n📂 **Done:** {humanize.naturalsize(current)} / {humanize.naturalsize(total)}")
     
-    try: await message.edit(msg)
-    except: pass
+    try: 
+        await message.edit(msg)
+    except MessageNotModified:
+        pass # Ignore if the text hasn't changed enough
+    except Exception:
+        pass
 
 async def get_duration(file_path):
     cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
@@ -75,7 +80,7 @@ async def start_cmd(client, message):
     await message.reply_text(
         "👋 **Welcome to Serial Splitter Bot!**\n\n"
         "Send me a large video file, and I will split it perfectly into 19MB parts.\n"
-        "Need to cancel a job? Just type /stop.\n\n"
+        "If you need to cancel a job, type /stop.\n\n"
         "📢 **Powered By:** @TeluguSerialsZone"
     )
 
@@ -84,7 +89,7 @@ async def stop_cmd(client, message):
     user_id = message.from_user.id
     if active_tasks.get(user_id):
         active_tasks[user_id] = False
-        await message.reply_text("🛑 **Stopping process and cleaning up disk...**")
+        await message.reply_text("🛑 **Force stopping process and cleaning up...**")
     else:
         await message.reply_text("⚠️ No active tasks to stop.")
 
@@ -111,12 +116,20 @@ async def main_handler(client, message):
     
     try:
         start_time = time.time()
-        temp_path = await client.download_media(
-            message, 
-            file_name=input_file, 
-            progress=progress_func, 
-            progress_args=(status, start_time, "📥 **Downloading Full Video to Disk**", user_id)
-        )
+        
+        # 1. DOWNLOAD WITH TIMEOUT
+        try:
+            temp_path = await asyncio.wait_for(
+                client.download_media(
+                    message, 
+                    file_name=input_file, 
+                    progress=progress_func, 
+                    progress_args=(status, start_time, "📥 **Downloading Full Video to Disk**", user_id)
+                ),
+                timeout=7200 # 2 hours max
+            )
+        except asyncio.TimeoutError:
+            raise Exception("Telegram dropped the download connection. Please try again.")
         
         await status.edit("⏳ **Calculating perfect frame split times...**")
         
@@ -140,6 +153,7 @@ async def main_handler(client, message):
         
         if not active_tasks.get(user_id): raise Exception("CANCELLED_BY_USER")
 
+        # 4. UPLOAD PARTS (WITH BULLETPROOF RETRY SYSTEM)
         parts = sorted(glob.glob(f"vid_{uid}_part_*.mp4"))
         total_parts = len(parts)
         
@@ -152,34 +166,45 @@ async def main_handler(client, message):
             os.rename(part_file, upload_path)
             caption_text = f"**{display_name}**\n\n⚜️ Powered By : @TeluguSerialsZone"
             
-            # --- THE NEW RETRY & FLOODWAIT SYSTEM ---
-            max_retries = 5
+            # --- THE IRON-CLAD UPLOAD LOOP ---
+            max_retries = 10  # Increased to 10 attempts
             for attempt in range(max_retries):
                 try:
                     up_start = time.time()
-                    await client.send_document(
-                        chat_id=message.chat.id, 
-                        document=upload_path, 
-                        file_name=display_name, 
-                        caption=caption_text,
-                        progress=progress_func,
-                        progress_args=(status, up_start, f"📤 **Uploading Part {part_no}/{total_parts}**", user_id)
+                    
+                    # 4-MINUTE KILL SWITCH per part
+                    await asyncio.wait_for(
+                        client.send_document(
+                            chat_id=message.chat.id, 
+                            document=upload_path, 
+                            file_name=display_name, 
+                            caption=caption_text,
+                            progress=progress_func,
+                            progress_args=(status, up_start, f"📤 **Uploading Part {part_no}/{total_parts}**", user_id)
+                        ),
+                        timeout=240 
                     )
-                    break # Success, break out of retry loop
+                    break # Success! Exit the retry loop.
+                    
+                except asyncio.TimeoutError:
+                    await status.edit(f"⚠️ **Network Hang Detected on Part {part_no}.**\nForce-restarting upload... (Attempt {attempt+1}/{max_retries})")
+                    await asyncio.sleep(3)
                     
                 except FloodWait as e:
-                    await status.edit(f"⚠️ **Telegram Throttling Uploads.**\nWaiting {e.value} seconds before resuming Part {part_no}...")
-                    await asyncio.sleep(e.value + 2) # Wait out the penalty + 2s buffer
+                    await status.edit(f"⚠️ **Telegram is throttling.**\nWaiting {e.value} seconds before resuming...")
+                    await asyncio.sleep(e.value + 5) # Generous wait to clear the ban
                     
                 except Exception as e:
                     if "CANCELLED_BY_USER" in str(e): 
                         raise e
                     if attempt == max_retries - 1:
-                        raise Exception(f"Failed to upload Part {part_no} after 5 attempts. Error: {str(e)}")
-                    await asyncio.sleep(5) # Wait 5 seconds before general retry
+                        raise Exception(f"Failed to upload Part {part_no} after {max_retries} attempts.")
+                    await asyncio.sleep(5)
             # ----------------------------------------
             
-            os.remove(upload_path)
+            # Delete part immediately to save disk space
+            if os.path.exists(upload_path):
+                os.remove(upload_path)
             
         await status.edit(f"✨ **All {total_parts} parts sent flawlessly!**\n\n🎥 `{f_name_no_ext}`")
 
